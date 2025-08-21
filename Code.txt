@@ -1,104 +1,254 @@
-
+#include <motion-detection_inferencing.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <DHT.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include "DHT.h"
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
 
-#define TEMP_THRESHOLD 35.0   
-#define GAS_THRESHOLD 3000    
+#define DHT_PIN               15
+#define DHT_TYPE              DHT22
+#define GAS_SENSOR_PIN        34
+#define ALERT_LED_PIN         25
+#define BUZZER_PIN            26
+#define RESET_BUTTON_PIN      0
 
-#define LED_PIN 25 
+#define TEMPERATURE_THRESHOLD 40.0
+#define GAS_THRESHOLD         800.0
+#define CONFIDENCE_THRESHOLD  0.70
 
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 const char* mqtt_server = "broker.hivemq.com";
-const char* mqtt_topic = "masters_project/A00048217/data";
-WiFiClient espClient;
-PubSubClient client(espClient);
-#define DHT_PIN 15
-#define GAS_SENSOR_PIN 34
-#define DHT_TYPE DHT22
+const char* mqtt_topic = "masters_project/A00048217/safety_data";
+
 DHT dht(DHT_PIN, DHT_TYPE);
 Adafruit_MPU6050 mpu;
+WiFiClient espClient;
+PubSubClient client(espClient);
 
-String check_hazards(float temp, int gas) {
-  if (temp > TEMP_THRESHOLD) {
-    digitalWrite(LED_PIN, HIGH); 
-    return "HIGH_TEMP";
-  }
-  if (gas > GAS_THRESHOLD) {
-    digitalWrite(LED_PIN, HIGH); 
-    return "HIGH_GAS";
-  }
-  
-  digitalWrite(LED_PIN, LOW); 
-  return "OK";
-}
+bool fall_alert_active = false;
+bool temp_alert_active = false;
+bool gas_alert_active = false;
+
+unsigned long last_reading_time = 0;
+unsigned long reading_interval = 1000;
 
 void setup_wifi() {
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+    delay(10);
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32_Hazard_Vest_Client")) {
-      Serial.println("connected");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+void reconnect_mqtt() {
+    while (!client.connected()) {
+        Serial.print("Attempting MQTT connection...");
+        String clientId = "ESP32_SafetySystem_A00048217-" + String(random(0xffff), HEX);
+        if (client.connect(clientId.c_str())) {
+            Serial.println("connected to HiveMQ");
+        } else {
+            Serial.print("failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" try again in 5 seconds");
+            delay(5000);
+        }
     }
-  }
+}
+
+String get_alert_status_string(bool is_fall, bool is_temp_high, bool is_gas_high) {
+    if (is_fall) {
+        if (is_temp_high && is_gas_high) return "FALL_TEMP_GAS";
+        if (is_temp_high) return "FALL_TEMP";
+        if (is_gas_high) return "FALL_GAS";
+        return "FALL_DETECTED";
+    }
+    if (is_temp_high && is_gas_high) return "HIGH_TEMP_GAS";
+    if (is_temp_high) return "HIGH_TEMP";
+    if (is_gas_high) return "HIGH_GAS";
+    return "OK";
 }
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  dht.begin();
-  mpu.begin();
-  Serial.println("Sensors Initialized.");
-  setup_wifi();
-  client.setServer(mqtt_server, 1883);
+    Serial.begin(115200);
+    Wire.begin();
+    dht.begin();
+    pinMode(ALERT_LED_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(GAS_SENSOR_PIN, INPUT);
+
+    while (!mpu.begin()) {
+        Serial.println("MPU6050 not found! Retrying...");
+        delay(1000);
+    }
+
+    digitalWrite(ALERT_LED_PIN, LOW);
+
+    setup_wifi();
+    client.setServer(mqtt_server, 1883);
+
+    Serial.println("\n================================================");
+    Serial.println("    SMART SAFETY SYSTEM - HYBRID MODE + MQTT");
+    Serial.println("================================================");
+    Serial.println("Features:");
+    Serial.println("- ML Fall Detection (TinyML)");
+    Serial.println("- Rule-based Temperature Monitoring");
+    Serial.println("- Rule-based Gas Detection");
+    Serial.println("- Sensor Fusion & Causal Analysis");
+    Serial.println("- HiveMQ MQTT Integration");
+    Serial.println("================================================\n");
 }
 
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
+    if (WiFi.status() == WL_CONNECTED && !client.connected()) {
+        reconnect_mqtt();
+    }
+    client.loop();
 
-  float humidity = dht.readHumidity();
-  float temperature = dht.readTemperature();
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  int gasValue = analogRead(GAS_SENSOR_PIN);
-  String alert_status = check_hazards(temperature, gasValue);
+    if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+        Serial.println("\n*** MANUAL RESET ACTIVATED ***");
+        fall_alert_active = false;
+        temp_alert_active = false;
+        gas_alert_active = false;
+        digitalWrite(ALERT_LED_PIN, LOW);
+        noTone(BUZZER_PIN);
+        Serial.println("All alerts cleared.\n");
+        char resetPayload[200];
+        snprintf(resetPayload, sizeof(resetPayload),
+                 "{\"studentID\":\"A00048217\",\"status\":\"SYSTEM_RESET\",\"message\":\"Manual reset activated\",\"timestamp\":%lu}",
+                 millis());
+        client.publish(mqtt_topic, resetPayload);
+        delay(1000);
+    }
 
-  char json_payload[250];
-  sprintf(json_payload, 
-    "{\"studentID\":\"A00048217\", \"status\":\"%s\", \"temperature\":%.2f, \"humidity\":%.2f, \"accel_x\":%.2f, \"accel_y\":%.2f, \"accel_z\":%.2f, \"gas_raw\":%d}",
-    alert_status.c_str(), temperature, humidity, a.acceleration.x, a.acceleration.y, a.acceleration.z, gasValue);
+    if (millis() - last_reading_time >= reading_interval) {
+        last_reading_time = millis();
 
-  Serial.print("Publishing message: ");
-  Serial.println(json_payload);
-  client.publish(mqtt_topic, json_payload);
+        sensors_event_t a, g, temp_event;
+        mpu.getEvent(&a, &g, &temp_event);
+        float temperature_c = dht.readTemperature();
+        float humidity = dht.readHumidity();
+        int gas_raw = analogRead(GAS_SENSOR_PIN);
+        float gas_ppm = map(gas_raw, 0, 4095, 0, 1023);
 
-  delay(5000);
+        float accel_features[] = {a.acceleration.x, a.acceleration.y, a.acceleration.z};
+        signal_t accel_signal;
+        accel_signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
+        int ret = numpy::signal_from_buffer(accel_features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &accel_signal);
+
+        if (ret != 0) {
+            ei_printf("ERR: signal_from_buffer failed (%d)\n", ret);
+            return;
+        }
+
+        ei_impulse_result_t accel_result = {0};
+        EI_IMPULSE_ERROR res = run_classifier(&accel_signal, &accel_result, false);
+
+        const char* motion_prediction = "unknown";
+        float motion_confidence = 0.0f;
+
+        if (res == EI_IMPULSE_OK) {
+            for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+                if (accel_result.classification[ix].value > motion_confidence) {
+                    motion_confidence = accel_result.classification[ix].value;
+                    motion_prediction = accel_result.classification[ix].label;
+                }
+            }
+        }
+
+        bool confident_fall = (strcmp(motion_prediction, "1") == 0 || strcmp(motion_prediction, "fall") == 0) &&
+                              (motion_confidence >= CONFIDENCE_THRESHOLD);
+
+        bool current_temp_hazard = (temperature_c > TEMPERATURE_THRESHOLD);
+        bool current_gas_hazard = (gas_ppm > GAS_THRESHOLD);
+
+        temp_alert_active = current_temp_hazard;
+        gas_alert_active = current_gas_hazard;
+
+        if (confident_fall && !fall_alert_active) {
+            fall_alert_active = true;
+        }
+
+        String alert_status = get_alert_status_string(fall_alert_active, current_temp_hazard, current_gas_hazard);
+        bool any_alert_active = (alert_status != "OK");
+
+        char json_payload[512];
+        snprintf(json_payload, sizeof(json_payload),
+                 "{\"studentID\":\"A00048217\",\"status\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,"
+                 "\"accel_x\":%.2f,\"accel_y\":%.2f,\"accel_z\":%.2f,\"gas_raw\":%d,\"gas_ppm\":%.2f,"
+                 "\"motion_prediction\":\"%s\",\"motion_confidence\":%.2f,\"fall_alert\":%s,"
+                 "\"temp_alert\":%s,\"gas_alert\":%s,\"uptime\":%lu}",
+                 alert_status.c_str(), temperature_c, humidity, a.acceleration.x, a.acceleration.y, a.acceleration.z,
+                 gas_raw, gas_ppm, motion_prediction, motion_confidence,
+                 fall_alert_active ? "true" : "false",
+                 temp_alert_active ? "true" : "false",
+                 gas_alert_active ? "true" : "false",
+                 millis());
+
+        if (client.publish(mqtt_topic, json_payload)) {
+            Serial.println("--> MQTT Publish: SUCCESS");
+        } else {
+            Serial.println("--> MQTT Publish: FAILED");
+        }
+
+        Serial.println("┌─────────────── SYSTEM STATUS ───────────────┐");
+        Serial.printf("│ Temperature: %6.2f°C  Status: %-8s │\n", temperature_c, current_temp_hazard ? "HIGH" : "Normal");
+        Serial.printf("│ Humidity:    %6.2f%%   Status: %-8s │\n", humidity, "Normal");
+        Serial.printf("│ Gas Level:   %6.0f ppm Status: %-8s │\n", gas_ppm, current_gas_hazard ? "HIGH" : "Normal");
+        Serial.printf("│ Accel X:     %6.2f m/s²                │\n", a.acceleration.x);
+        Serial.printf("│ Accel Y:     %6.2f m/s²                │\n", a.acceleration.y);
+        Serial.printf("│ Accel Z:     %6.2f m/s²                │\n", a.acceleration.z);
+        Serial.printf("│ Motion:      %-8s  Confidence: %.2f   │\n", motion_prediction, motion_confidence);
+        Serial.printf("│ MQTT Status: %-8s  WiFi: %-8s     │\n", client.connected() ? "Connected" : "Offline", WiFi.status() == WL_CONNECTED ? "Connected" : "Offline");
+        Serial.println("└──────────────────────────────────────────────┘");
+
+        Serial.println("┌─────────────── ALERT STATUS ────────────────┐");
+        if (fall_alert_active) {
+            Serial.println("│ 🚨 CRITICAL: FALL DETECTED!                 │");
+            if (current_temp_hazard && current_gas_hazard) {
+                Serial.println("│    → Probable Cause: HIGH TEMP + GAS        │");
+            } else if (current_temp_hazard) {
+                Serial.println("│    → Probable Cause: Heat-related incident  │");
+            } else if (current_gas_hazard) {
+                Serial.println("│    → Probable Cause: Gas exposure           │");
+            } else {
+                Serial.println("│    → Environmental factors appear normal    │");
+            }
+        }
+        if (current_temp_hazard && !fall_alert_active) {
+            Serial.println("│ ⚠️  WARNING: High Temperature Detected       │");
+        }
+        if (current_gas_hazard && !fall_alert_active) {
+            Serial.println("│ ⚠️  WARNING: Hazardous Gas Detected          │");
+        }
+        if (!any_alert_active) {
+            Serial.println("│ ✅ All systems normal - No hazards detected │");
+        }
+        Serial.println("└──────────────────────────────────────────────┘");
+
+        if (any_alert_active) {
+            digitalWrite(ALERT_LED_PIN, HIGH);
+            tone(BUZZER_PIN, 1000, 200);
+        } else {
+            digitalWrite(ALERT_LED_PIN, LOW);
+            noTone(BUZZER_PIN);
+        }
+
+        if (fall_alert_active) {
+            Serial.println("\n🚨 EMERGENCY RESPONSE REQUIRED:");
+            Serial.println("   1. Check worker consciousness");
+            Serial.println("   2. Call emergency services if needed");
+            Serial.println("   3. Press BOOT button to reset alerts");
+            Serial.println("   4. Check MQTT dashboard for remote monitoring");
+        }
+
+        Serial.println("\n" + String('=', 50) + "\n");
+    }
 }
-
-
