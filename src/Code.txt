@@ -1,3 +1,4 @@
+//Libraries gives pre built fucntions to communicate with sensors and modules 
 #include <motion-detection_inferencing.h>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
@@ -6,6 +7,8 @@
 #include <PubSubClient.h>
 #include <math.h>
 
+//Mapping of hardware pins and their functions
+
 #define DHT_PIN               15
 #define DHT_TYPE              DHT22
 #define GAS_SENSOR_PIN        34
@@ -13,23 +16,33 @@
 #define BUZZER_PIN            26  
 #define RESET_BUTTON_PIN      0    
 
+//Defining thresholds like  danger limits for each hazards
+
 #define TEMPERATURE_THRESHOLD 40.0  
 #define GAS_THRESHOLD         800.0 
 #define CONFIDENCE_THRESHOLD  0.70  
+
+//Wifi and MQTT settings
 
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 const char* mqtt_server = "broker.hivemq.com";
 const char* mqtt_topic = "SafetySystem/A00048217/safety_data";
 
+//Objects for sensors and communication
+
 DHT dht(DHT_PIN, DHT_TYPE);
 Adafruit_MPU6050 mpu;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+//Alert flags and used to check whether an alert is active
+
 bool fall_alert_active = false;
 bool temp_alert_active = false;
 bool gas_alert_active = false;
+
+//Adaptive Pacing - It normally polls for every 3s and speeds up upto 300ms for 15s once a risk is detected
 
 unsigned long last_reading_time = 0;
 unsigned long last_event_ms = 0;
@@ -37,10 +50,14 @@ const unsigned long SAFE_INTERVAL_MS  = 3000;
 const unsigned long ALERT_INTERVAL_MS = 300;
 const unsigned long COOL_DOWN_MS      = 15000;
 
+//Testing using ground truth with scenarios in order to measure latency
+
 String current_scenario = "UNSET";
 unsigned long temp_onset_ms = 0, gas_onset_ms = 0, fall_gt_onset_ms = 0;
 bool temp_gt_active = false, gas_gt_active = false, fall_gt_active = false;
 static unsigned long last_tick_ms = 0;
+
+//Trend Buffers used for pre warning where 12 values are stores to detect fast rises
 
 const int N = 12;
 float gas_hist[N]  = {0};
@@ -58,6 +75,8 @@ bool trend_rising(const float *h, int n, float min_delta) {
   return delta >= min_delta;
 }
 
+//Physics fall back logic for fall detection, where we use accelerometer data to detect falls based on spikes and freefall
+
 bool fallback_fall(const sensors_event_t& acc) {
   float ax = acc.acceleration.x, ay = acc.acceleration.y, az = acc.acceleration.z;
   float mag = sqrtf(ax*ax + ay*ay + az*az);
@@ -67,6 +86,8 @@ bool fallback_fall(const sensors_event_t& acc) {
   bool near_freefall = (mag < 3.0f);
   return spike || (near_freefall && (millis() - last_spike < 800));
 }
+
+//Wifi & MQTT helper functions which helps the keeps the device connected and publishes data
 
 void setup_wifi() {
   delay(10);
@@ -96,6 +117,11 @@ void reconnect_mqtt() {
     }
   }
 }
+
+
+//In this section, we will initialize the sensors and communication protocols 
+//and print a CSV header which will be used for analyzing the data
+
 
 void setup() {
   Serial.begin(115200);
@@ -127,6 +153,11 @@ void setup() {
   Serial.println("ts_ms,scenario,tempC,hum,gas_ppm,ax,ay,az,pred,conf,fall_alert,temp_alert,gas_alert,status,mqtt_ok,lat_temp_ms,lat_gas_ms,lat_fall_ms,loop_interval_ms");
 }
 
+
+//Keeps the device connected to WiFi and MQTT broker
+//Ground truth testing for scenario validation for latency measurement
+
+
 void loop() {
   if (WiFi.status() == WL_CONNECTED && !client.connected()) {
     reconnect_mqtt();
@@ -147,6 +178,9 @@ void loop() {
     else if (cmd == "GT:FALL:OFF")   { fall_gt_active = false; }
   }
 
+
+  //Reset button used for manual reset of alerts
+
   if (digitalRead(RESET_BUTTON_PIN) == LOW) {
     Serial.println("\n*** MANUAL RESET ACTIVATED ***");
     fall_alert_active = false;
@@ -164,11 +198,15 @@ void loop() {
     delay(1000);
   }
 
+//logic for adaptive pacing
+
   bool hazard_prev = fall_alert_active || temp_alert_active || gas_alert_active;
   if (hazard_prev) last_event_ms = millis();
   unsigned long target_interval = (millis() - last_event_ms > COOL_DOWN_MS) ? SAFE_INTERVAL_MS : ALERT_INTERVAL_MS;
   if (millis() - last_reading_time < target_interval) return;
   last_reading_time = millis();
+
+  //this part reads the sensor data and and performs necessary checks
 
   sensors_event_t a, g, temp_event;
   mpu.getEvent(&a, &g, &temp_event);
@@ -182,6 +220,8 @@ void loop() {
   if (!dht_ok || !mpu_ok) {
     Serial.println("<<WARNING: Sensor read invalid>>");
   }
+
+//Pre warning checks for gas and temperature 
 
   gas_hist[hist_ix]  = gas_ppm;
   temp_hist[hist_ix] = temperature_c;
@@ -198,6 +238,8 @@ void loop() {
     return 0;
   };
 
+  //Runs the edge impulse classifier on the accelerometer data
+
   ei_impulse_result_t accel_result = {0};
   EI_IMPULSE_ERROR res = run_classifier(&accel_signal, &accel_result, false);
 
@@ -212,8 +254,13 @@ void loop() {
     }
   }
 
+
+  //Checks the motion prediction and confidence with thresholds
+
   bool confident_fall = (strcmp(motion_prediction, "1") == 0 || strcmp(motion_prediction, "fall") == 0) &&
                         (motion_confidence >= CONFIDENCE_THRESHOLD);
+
+//Environmental hazard checks using the thresholds for gas and temperature
 
   bool current_temp_hazard = (temperature_c > TEMPERATURE_THRESHOLD);
   bool current_gas_hazard = (gas_ppm > GAS_THRESHOLD);
@@ -221,8 +268,12 @@ void loop() {
   temp_alert_active = current_temp_hazard;
   gas_alert_active = current_gas_hazard;
 
+// Logic for the fallback mechanism
+
   bool fb_fall = fallback_fall(a);
   fall_alert_active = confident_fall || fb_fall;
+
+// Labelling of the status
 
   String alert_status = "OK";
   if (fall_alert_active) {
@@ -236,6 +287,8 @@ void loop() {
 
   bool any_alert_active = (alert_status != "OK");
   if (any_alert_active) last_event_ms = millis();
+
+// JSON payload creation for MQTT communication and logging
 
   char json_payload[512];
   snprintf(json_payload, sizeof(json_payload),
@@ -251,6 +304,9 @@ void loop() {
           millis());
   bool mqtt_ok = client.publish(mqtt_topic, json_payload);
 
+
+//Logic to compute the latency  of the alerts and their onset times
+
   unsigned long now_ms = millis();
   unsigned long loop_interval_ms = (last_tick_ms == 0) ? 0 : (now_ms - last_tick_ms);
   last_tick_ms = now_ms;
@@ -258,6 +314,8 @@ void loop() {
   long lat_temp = (temp_gt_active && temp_alert_active) ? (long)(now_ms - temp_onset_ms) : -1;
   long lat_gas  = (gas_gt_active  && gas_alert_active)  ? (long)(now_ms - gas_onset_ms)  : -1;
   long lat_fall = (fall_gt_active && fall_alert_active) ? (long)(now_ms - fall_gt_onset_ms) : -1;
+
+// Printing the latency values  in a CSV format for logging and analysis
 
   Serial.print(now_ms); Serial.print(",");
   Serial.print(current_scenario); Serial.print(",");
@@ -278,6 +336,8 @@ void loop() {
   Serial.print(lat_gas);  Serial.print(",");
   Serial.print(lat_fall); Serial.print(",");
   Serial.println(loop_interval_ms);
+
+//Detailed status report printing for user awareness and alerting using buzzer and LED
 
   Serial.println("\n----------------------------------------");
   Serial.println("SYSTEM STATUS");
